@@ -1,0 +1,534 @@
+openapi: 3.0.3
+info:
+  title: Receipt API
+  version: 1.0.0
+  description: |
+    Upload a receipt, extract one transaction with its taxes and line items, and review itemization.
+    JSON fields use snake_case.
+    Money, rates and quantities use `format: decimal` and map to BigDecimal (no floating point).
+    Money has 2 decimal places, rates up to 6, quantities 3.
+
+servers:
+  - url: http://localhost:8080
+
+security: []
+
+tags:
+  - name: health
+    description: Service status
+  - name: receipts
+    description: Upload and process receipts
+  - name: transactions
+    description: View and edit transactions and line items
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      operationId: health
+      summary: Health check (includes a database check)
+      responses:
+        '200':
+          description: Service and database are up
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: Database is not reachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: DOWN
+
+  /receipts:
+    post:
+      tags: [receipts]
+      operationId: uploadReceipt
+      summary: Upload a receipt file
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: jpeg, png, pdf or txt
+      responses:
+        '201':
+          description: Receipt stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receipt'
+        '400':
+          description: No file or empty file
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: BAD_REQUEST
+                message: File is missing or empty
+        '413':
+          description: File too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: FILE_TOO_LARGE
+                message: File is larger than 10 MB
+        '415':
+          description: Unsupported file type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: UNSUPPORTED_MEDIA_TYPE
+                message: Only jpeg, png, pdf and txt are allowed
+
+  /receipts/{receiptId}/process:
+    post:
+      tags: [receipts]
+      operationId: processReceipt
+      summary: Run OCR and extraction
+      description: |
+        Creates the transaction, taxes and line items. Can run again on the same receipt;
+        it updates the same transaction and replaces all taxes and items, including items the user edited.
+        A FAILED result is still 200, with the status in the body.
+      parameters:
+        - $ref: '#/components/parameters/ReceiptId'
+      responses:
+        '200':
+          description: Transaction created or updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '404':
+          description: Receipt not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: NOT_FOUND
+                message: Receipt 99 not found
+        '409':
+          description: Receipt file is missing from file storage, or version conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                file_missing:
+                  summary: File not in storage
+                  value:
+                    error: RECEIPT_FILE_MISSING
+                    message: File for receipt 1 not found in storage
+                version_conflict:
+                  $ref: '#/components/examples/VersionConflict'
+
+  /transactions/{transactionId}:
+    get:
+      tags: [transactions]
+      operationId: getTransaction
+      summary: Get a transaction with taxes and line items
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Transaction
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '404':
+          $ref: '#/components/responses/TransactionNotFound'
+
+  /transactions/{transactionId}/itemize:
+    post:
+      tags: [transactions]
+      operationId: reitemizeTransaction
+      summary: Re-run auto-itemize from stored OCR text
+      description: |
+        Replaces all line items, including items the user edited. Header and taxes are not changed.
+        The transaction id stays the same.
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Transaction with new line items
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '404':
+          $ref: '#/components/responses/TransactionNotFound'
+        '409':
+          description: Another request changed the transaction first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                version_conflict:
+                  $ref: '#/components/examples/VersionConflict'
+
+  /transactions/{transactionId}/items:
+    patch:
+      tags: [transactions]
+      operationId: replaceTransactionItems
+      summary: Replace line items (edit, merge, split)
+      description: |
+        Send the full new list of items. If they don't reconcile with the stored total and taxes,
+        or the transaction is FAILED, returns 409 and saves nothing.
+        Send `version` from the last GET to guard against overwriting someone else's edit;
+        if it does not match, or another request saved first, returns 409 VERSION_CONFLICT.
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchItemsRequest'
+      responses:
+        '200':
+          description: Items saved, status COMPLETE
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '400':
+          description: Invalid item (blank or too long description, too many decimals, out of range) or empty list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                blank_description:
+                  summary: Blank description
+                  value:
+                    error: BAD_REQUEST
+                    message: items[0].description must not be blank
+                too_many_decimals:
+                  summary: Amount has more than 2 decimals
+                  value:
+                    error: BAD_REQUEST
+                    message: items[1].amount must have at most 2 decimal places
+        '404':
+          $ref: '#/components/responses/TransactionNotFound'
+        '409':
+          description: Items do not reconcile, transaction is FAILED, or version conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconcileError'
+              examples:
+                mismatch:
+                  summary: Items do not add up
+                  value:
+                    error: ITEMS_DO_NOT_RECONCILE
+                    message: Line items do not match the receipt total
+                    grand_total: 18.50
+                    exclusive_taxes: 1.90
+                    expected_items_total: 16.60
+                    actual_items_total: 10.00
+                    difference: -6.60
+                failed:
+                  summary: Transaction has no total
+                  value:
+                    error: TRANSACTION_FAILED
+                    message: No grand total to reconcile against
+                    grand_total: null
+                    exclusive_taxes: null
+                    expected_items_total: null
+                    actual_items_total: null
+                    difference: null
+                version_conflict:
+                  summary: Transaction was changed by another request
+                  value:
+                    error: VERSION_CONFLICT
+                    message: Transaction 1 was changed (current version 3). Reload and try again
+                    grand_total: null
+                    exclusive_taxes: null
+                    expected_items_total: null
+                    actual_items_total: null
+                    difference: null
+
+components:
+  parameters:
+    ReceiptId:
+      name: receiptId
+      in: path
+      required: true
+      description: Receipt id
+      schema:
+        type: integer
+        format: int64
+    TransactionId:
+      name: transactionId
+      in: path
+      required: true
+      description: Transaction id
+      schema:
+        type: integer
+        format: int64
+
+  examples:
+    VersionConflict:
+      summary: Transaction was changed by another request
+      value:
+        error: VERSION_CONFLICT
+        message: Transaction 1 was changed (current version 3). Reload and try again
+
+  responses:
+    TransactionNotFound:
+      description: Transaction not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: NOT_FOUND
+            message: Transaction 99 not found
+
+  schemas:
+    Money:
+      type: number
+      format: decimal
+      description: Amount with 2 decimal places (BigDecimal)
+      example: 17.85
+
+    NullableMoney:
+      type: number
+      format: decimal
+      nullable: true
+      description: Amount with 2 decimal places (BigDecimal), or null
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN]
+          example: UP
+
+    Receipt:
+      type: object
+      required: [receipt_id, filename, content_type, size_bytes]
+      properties:
+        receipt_id:
+          type: integer
+          format: int64
+          example: 1
+        filename:
+          type: string
+          example: receipt-clean.txt
+        content_type:
+          type: string
+          example: text/plain
+        size_bytes:
+          type: integer
+          format: int64
+          example: 252
+
+    Transaction:
+      type: object
+      required: [id, receipt_id, taxes, line_items, itemize_status, version]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        receipt_id:
+          type: integer
+          format: int64
+          example: 1
+        merchant:
+          type: string
+          nullable: true
+          example: Cafe Mitte
+        date:
+          type: string
+          format: date
+          nullable: true
+          example: '2026-03-12'
+        currency:
+          type: string
+          nullable: true
+          example: EUR
+        grand_total:
+          type: number
+          format: decimal
+          nullable: true
+          description: 2 decimal places (BigDecimal). Null only when itemize_status is FAILED
+          example: 17.85
+        taxes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tax'
+        line_items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LineItem'
+        itemize_status:
+          type: string
+          enum: [COMPLETE, NEEDS_REVIEW, FAILED]
+        itemize_note:
+          type: string
+          nullable: true
+        version:
+          type: integer
+          format: int64
+          description: Changes on every update. Send it back in PATCH to detect conflicting edits.
+          example: 0
+      example:
+        id: 1
+        receipt_id: 1
+        merchant: Cafe Mitte
+        date: '2026-03-12'
+        currency: EUR
+        grand_total: 17.85
+        taxes:
+          - { name: VAT, rate: 0.19, amount: 2.85, inclusive: false }
+        line_items:
+          - { description: Espresso, amount: 3.50, quantity: null, tax_amount: null, source: AUTO }
+          - { description: Sandwich, amount: 8.90, quantity: null, tax_amount: null, source: AUTO }
+          - { description: Mineral water, amount: 2.60, quantity: null, tax_amount: null, source: AUTO }
+        itemize_status: COMPLETE
+        itemize_note: null
+        version: 0
+
+    Tax:
+      type: object
+      required: [name, rate, amount, inclusive]
+      properties:
+        name:
+          type: string
+          example: VAT
+        rate:
+          type: number
+          format: decimal
+          minimum: 0
+          maximum: 1
+          description: Fraction with up to 6 decimal places (BigDecimal), e.g. 0.19 for 19%, 0.08875 for 8.875%
+          example: 0.19
+        amount:
+          $ref: '#/components/schemas/Money'
+        inclusive:
+          type: boolean
+          description: true = tax is already inside the total ("incl. VAT")
+
+    LineItem:
+      type: object
+      required: [description, amount, source]
+      properties:
+        description:
+          type: string
+        amount:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: As printed on the receipt
+        quantity:
+          type: number
+          format: decimal
+          nullable: true
+          description: 3 decimal places (BigDecimal)
+        tax_amount:
+          type: number
+          format: decimal
+          nullable: true
+          description: 2 decimal places (BigDecimal)
+        source:
+          type: string
+          enum: [AUTO, USER]
+
+    ItemInput:
+      type: object
+      description: Values that don't fit the columns are rejected with 400, never rounded.
+      required: [description, amount]
+      properties:
+        description:
+          type: string
+          minLength: 1
+          maxLength: 255
+        amount:
+          type: number
+          format: decimal
+          minimum: 0
+          maximum: 9999999999.99
+          description: As printed on the receipt. At most 2 decimal places (BigDecimal)
+        quantity:
+          type: number
+          format: decimal
+          exclusiveMinimum: true
+          minimum: 0
+          maximum: 9999999.999
+          description: At most 3 decimal places (BigDecimal)
+        tax_amount:
+          type: number
+          format: decimal
+          minimum: 0
+          maximum: 9999999999.99
+          description: At most 2 decimal places (BigDecimal)
+
+    PatchItemsRequest:
+      type: object
+      required: [items]
+      properties:
+        version:
+          type: integer
+          format: int64
+          description: Optional. The version from the last GET; if it does not match, returns 409 VERSION_CONFLICT.
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ItemInput'
+      example:
+        version: 0
+        items:
+          - { description: Water, amount: 4.00 }
+          - { description: Snacks, amount: 6.00 }
+          - { description: Minibar, amount: 6.60 }
+
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+
+    ReconcileError:
+      type: object
+      required: [error, message]
+      description: Number fields are null when the transaction is FAILED
+      properties:
+        error:
+          type: string
+          enum: [ITEMS_DO_NOT_RECONCILE, TRANSACTION_FAILED, VERSION_CONFLICT]
+        message:
+          type: string
+        grand_total:
+          $ref: '#/components/schemas/NullableMoney'
+        exclusive_taxes:
+          $ref: '#/components/schemas/NullableMoney'
+        expected_items_total:
+          $ref: '#/components/schemas/NullableMoney'
+        actual_items_total:
+          $ref: '#/components/schemas/NullableMoney'
+        difference:
+          $ref: '#/components/schemas/NullableMoney'
